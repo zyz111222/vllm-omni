@@ -88,6 +88,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._batch_stats_decoded_frames = 0
         self._batch_stats_actual_frames: Counter[int] = Counter()
         self._batch_stats_bucket_groups: Counter[tuple[int, int]] = Counter()
+        self._decoder_linear_weights_transformed_for_npu = False
 
         # Construct decoder from config so it is visible to vLLM's
         # memory profiler at startup.  Weights are loaded later in
@@ -545,7 +546,6 @@ class Qwen3TTSCode2Wav(nn.Module):
                 continue
             wav = wav[start : min(end, wav.shape[0])]
             if wav.shape[0] > 0:
-                # Decoder already runs in fp32, so the .to(float32) is a redundant dispatch.
                 audios[idx] = (wav if wav.dtype == torch.float32 else wav.to(torch.float32)).reshape(-1)
 
         for req_id, finished in zip(ref_context_request_ids, finished_flags, strict=False):
@@ -602,7 +602,10 @@ class Qwen3TTSCode2Wav(nn.Module):
         ).load_weights(subfolder_weights)
 
         device = self.vllm_config.device_config.device
-        self.decoder.to(device=device, dtype=torch.float32)
+        model_cfg = getattr(self.vllm_config, "model_config", None)
+        decoder_dtype = getattr(model_cfg, "dtype", torch.float32)
+        self.decoder.to(device=device, dtype=decoder_dtype)
+        self._maybe_transform_decoder_linear_weights_for_npu()
 
         # Precompute SnakeBeta exp caches (benefits both Triton and eager paths)
         if hasattr(self.decoder, "precompute_snake_caches"):
@@ -613,7 +616,6 @@ class Qwen3TTSCode2Wav(nn.Module):
         # streaming window here causes repeated overlap decode in Code2Wav.
         codec_chunk_frames = 0
         codec_left_context_frames = 0
-        model_cfg = getattr(self.vllm_config, "model_config", None)
         connector_cfg = getattr(model_cfg, "stage_connector_config", None)
         extra_cfg = (
             connector_cfg.get("extra", connector_cfg)
@@ -782,3 +784,18 @@ class Qwen3TTSCode2Wav(nn.Module):
                 )
 
         return loaded
+
+    def _maybe_transform_decoder_linear_weights_for_npu(self) -> None:
+        if self._decoder_linear_weights_transformed_for_npu:
+            return
+        from vllm_ascend.utils import maybe_trans_nz
+
+        transformed = 0
+        with torch.no_grad():
+            for module in self.decoder.modules():
+                if isinstance(module, nn.Linear):
+                    module.weight.data = maybe_trans_nz(module.weight.data)
+                    transformed += 1
+        self._decoder_linear_weights_transformed_for_npu = True
+        if transformed:
+            logger.info_once("Code2Wav: transformed %d decoder Linear weights for NPU layout", transformed)

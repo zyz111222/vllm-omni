@@ -125,13 +125,14 @@ class _Qwen3CodePredictorAttention310P(qwen3_code_predictor.CodePredictorAttenti
         cos, sin = position_embeddings
         cos = cos.unsqueeze(1)
         sin = sin.unsqueeze(1)
-        q = (q * cos) + (qwen3_code_predictor._rotate_half(q) * sin)
-        k = (k * cos) + (qwen3_code_predictor._rotate_half(k) * sin)
+        import torch_npu
+
+        q = torch_npu.npu_rotary_mul(q, cos, sin)
+        k = torch_npu.npu_rotary_mul(k, cos, sin)
 
         real_tokens = int(bsz) * int(seq_len)
         output_dtype = q.dtype
 
-        import torch_npu
         from vllm_ascend.utils import aligned_16
 
         q_f = aligned_16(q.to(torch.float16).transpose(1, 2).reshape(real_tokens, self.num_heads, self.head_dim))
@@ -205,15 +206,14 @@ class _Qwen3CodePredictorBaseModel310P(qwen3_code_predictor.CodePredictorBaseMod
 
         input_dtype = inputs_embeds.dtype
         hidden_states = inputs_embeds
-        with torch.amp.autocast(inputs_embeds.device.type, enabled=False, dtype=torch.float32):
-            position_embeddings = self.rotary_emb(hidden_states, position_ids)
-            for layer in self.layers:
-                hidden_states = layer(
-                    hidden_states,
-                    position_embeddings,
-                    attention_mask=self._attention_mask_310p,
-                )
-            hidden_states = self.norm(hidden_states)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        for layer in self.layers:
+            hidden_states = layer(
+                hidden_states,
+                position_embeddings,
+                attention_mask=self._attention_mask_310p,
+            )
+        hidden_states = self.norm(hidden_states)
         return hidden_states.to(input_dtype)
 
 
