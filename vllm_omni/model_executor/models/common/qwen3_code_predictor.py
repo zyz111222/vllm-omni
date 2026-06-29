@@ -72,8 +72,7 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 class _RotaryEmbedding(nn.Module):
     """RoPE matching HuggingFace's implementation exactly.
 
-    Precomputes cos/sin once and reuses the cache during the short
-    code-predictor re-prefill loop.
+    Forces float32 computation for cos/sin, matching HF's torch.autocast(enabled=False).
     """
 
     def __init__(self, config) -> None:
@@ -86,18 +85,21 @@ class _RotaryEmbedding(nn.Module):
         rope_theta = getattr(config, "rope_theta", 10000.0)
         inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        max_seq = int(getattr(config, "num_code_groups", 0) or 0) + 1
-        positions = torch.arange(max_seq, dtype=torch.float32)
-        freqs = torch.outer(positions, inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos(), persistent=False)
-        self.register_buffer("sin_cached", emb.sin(), persistent=False)
 
     def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # position_ids: [batch, seq_len]
-        cos = self.cos_cached.to(device=x.device, dtype=x.dtype)
-        sin = self.sin_cached.to(device=x.device, dtype=x.dtype)
-        return cos[position_ids], sin[position_ids]
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        position_ids_expanded = position_ids[:, None, :].float()
+
+        # Force float32 (matching HF)
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
 # ===================================================================
@@ -225,14 +227,8 @@ class CodePredictorAttention(nn.Module):
         # cos/sin are [batch, seq_len, head_dim], need unsqueeze at dim=1 for heads
         cos = cos.unsqueeze(1)  # [batch, 1, seq_len, head_dim]
         sin = sin.unsqueeze(1)
-        if current_omni_platform.is_npu():
-            import torch_npu
-
-            q = torch_npu.npu_rotary_mul(q, cos, sin)
-            k = torch_npu.npu_rotary_mul(k, cos, sin)
-        else:
-            q = (q * cos) + (_rotate_half(q) * sin)
-            k = (k * cos) + (_rotate_half(k) * sin)
+        q = (q * cos) + (_rotate_half(q) * sin)
+        k = (k * cos) + (_rotate_half(k) * sin)
 
         if not current_omni_platform.is_npu():
             attn_out = F.scaled_dot_product_attention(
@@ -358,7 +354,7 @@ class CodePredictorBaseModel(nn.Module):
         # autocast to float32 is unsupported on CPU; skip fp32 upcast there
         # (CPU uses full-precision intermediates internally).
         input_dtype = inputs_embeds.dtype
-        use_fp32 = input_dtype == torch.float16 and inputs_embeds.device.type not in ("cpu", "npu")
+        use_fp32 = input_dtype == torch.float16 and inputs_embeds.device.type != "cpu"
         if use_fp32:
             inputs_embeds = inputs_embeds.float()
         hidden_states = inputs_embeds
@@ -474,8 +470,6 @@ class CodePredictorWrapper(nn.Module):
         self._bucket_pos_ids: dict[int | tuple[int, int], torch.Tensor] = {}
         self._lm_heads_list: list[nn.Module] | None = None
         self._codec_embeds_list: list[nn.Module] | None = None
-        self._linear_weights_transformed_for_npu = False
-        self.register_buffer("_projected_codec_embed_weight", None, persistent=False)
         self._device_graphs: dict[int | tuple[int, int], tuple] = {}  # (graph, static_output) per bucket
         prefix_graph_cfg = self._stage_connector_extra_config(vllm_config)
         prefix_graphs_requested = self._parse_bool_config(prefix_graph_cfg.get("code_predictor_prefix_graphs"))
@@ -528,10 +522,8 @@ class CodePredictorWrapper(nn.Module):
         # on every call.  Also ensures warmup buffers match model precision
         # even when upstream modules produce a different dtype (#2385).
         self._model_dtype = next(self.model.parameters()).dtype
-        self._maybe_transform_linear_weights_for_npu()
         self._lm_heads_list = list(self.lm_head)
         self._codec_embeds_list = list(self.model.codec_embedding)
-        self._build_projected_codec_embed_weight()
 
         if not current_omni_platform.supports_torch_inductor():
             # NPU or other platforms without Inductor support
@@ -569,39 +561,6 @@ class CodePredictorWrapper(nn.Module):
             if bsz <= bucket:
                 return bucket
         return bsz
-
-    def _maybe_transform_linear_weights_for_npu(self) -> None:
-        """Apply Ascend's persistent linear weight layout conversion once."""
-        if self._linear_weights_transformed_for_npu:
-            return
-        from vllm_ascend.utils import maybe_trans_nz
-
-        transformed = 0
-        with torch.no_grad():
-            for module in self.modules():
-                if isinstance(module, nn.Linear):
-                    module.weight.data = maybe_trans_nz(module.weight.data)
-                    transformed += 1
-        self._linear_weights_transformed_for_npu = True
-        if transformed:
-            logger.info_once("code_predictor: transformed %d Linear weights for NPU layout", transformed)
-
-    def _build_projected_codec_embed_weight(self) -> None:
-        """Pre-fold codec embeddings through the small-to-MTP projection."""
-        codec_embeds = self._codec_embeds_list
-        if codec_embeds is None or self._wrapper_config.use_parallel_embedding:
-            self._projected_codec_embed_weight = None
-            return
-
-        projection = self.small_to_mtp_projection
-        projected_weights: list[torch.Tensor] = []
-        with torch.no_grad():
-            for embed_layer in codec_embeds:
-                if not isinstance(embed_layer, nn.Embedding):
-                    self._projected_codec_embed_weight = None
-                    return
-                projected_weights.append(projection(embed_layer.weight).detach())
-        self._projected_codec_embed_weight = torch.stack(projected_weights, dim=0).contiguous()
 
     @staticmethod
     def _stage_connector_extra_config(vllm_config: VllmConfig) -> dict:
@@ -814,7 +773,6 @@ class CodePredictorWrapper(nn.Module):
         model_fwd = self._compiled_model_fwd
         lm_heads = self._lm_heads_list
         codec_embeds = self._codec_embeds_list
-        projected_codec_embed_weight = self._projected_codec_embed_weight
 
         # Zero the padded region of the buffer
         proj_buf[:padded_bsz].zero_()
@@ -909,15 +867,8 @@ class CodePredictorWrapper(nn.Module):
 
             # Embed predicted code -> project -> next buffer position
             if step < num_groups - 1 or self._wrapper_config.return_proj_buf:
-                if projected_codec_embed_weight is not None:
-                    proj_buf[:bsz, step + 1, :].copy_(
-                        F.embedding(code.reshape(-1), projected_codec_embed_weight[step - 1])
-                    )
-                else:
-                    new_embed = codec_embeds[step - 1](code)
-                    proj_buf[:bsz, step + 1, :].copy_(
-                        projection(new_embed.reshape(bsz, 1, -1)).reshape(bsz, -1)
-                    )
+                new_embed = codec_embeds[step - 1](code)
+                proj_buf[:bsz, step + 1, :] = projection(new_embed.reshape(bsz, 1, -1)).reshape(bsz, -1)
 
         if self._wrapper_config.return_proj_buf:
             return all_codes, proj_buf[:bsz].clone()
