@@ -111,8 +111,23 @@ class _Qwen3TTSPromptEmbedsBuilder310P(prompt_embeds_builder.Qwen3TTSPromptEmbed
         return spk.to(dtype=dtype)
 
 
+# ===================================================================
+#  CodePredictor layer patches
+# ===================================================================
+#
+# Keep the portable implementation in common/qwen3_code_predictor.py.
+# The overrides below are installed only by the 310P platform patch because
+# the short CodePredictor loop is graph-captured on 310P and profiling shows
+# repeated layout conversion plus unfused normalization/RoPE kernels there.
+
+
 class _RMSNorm310P(nn.Module):
-    """310P RMSNorm implementation backed by the Ascend NPU fused operator."""
+    """RMSNorm using the Ascend NPU fused kernel on 310P.
+
+    The generic layer keeps HuggingFace-compatible PyTorch math.  On 310P that
+    expands to multiple small elementwise kernels, so the patch uses the fused
+    operator while retaining the generic fallback for non-NPU execution.
+    """
 
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -138,12 +153,11 @@ class _RMSNorm310P(nn.Module):
 
 
 class _RotaryEmbedding310P(nn.Module):
-    """RoPE cache for the short 310P CodePredictor re-prefill sequence.
+    """RoPE with a static cos/sin cache for CodePredictor.
 
-    The generic implementation follows HuggingFace numerics and builds
-    cos/sin every forward.  On 310P the sequence length is bounded by the
-    codebook count, so the table is static and can be materialized once before
-    NPU graph capture.
+    CodePredictor only attends over ``num_code_groups + 1`` tokens.  Caching
+    the table removes repeated outer-product, cos, and sin kernels from the
+    captured 310P loop without changing the shared implementation.
     """
 
     def __init__(self, config) -> None:
@@ -157,6 +171,8 @@ class _RotaryEmbedding310P(nn.Module):
         inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
+        # CodePredictor attends over a fixed short sequence, so the RoPE table
+        # can be materialized once before NPU graph capture.
         max_seq = int(getattr(config, "num_code_groups", 0) or 0) + 1
         positions = torch.arange(max_seq, dtype=torch.float32)
         freqs = torch.outer(positions, inv_freq)
@@ -169,6 +185,13 @@ class _RotaryEmbedding310P(nn.Module):
 
 
 class _Qwen3CodePredictorAttention310P(qwen3_code_predictor.CodePredictorAttention):
+    """Attention override using 310P RoPE and flash-attention kernels.
+
+    The shared attention path is written in portable PyTorch.  This override
+    keeps the 310P-specific RoPE op, token alignment, and FRACTAL_NZ mask path
+    localized to the platform patch.
+    """
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._buffers.pop("_fusion_causal_mask", None)
@@ -195,6 +218,8 @@ class _Qwen3CodePredictorAttention310P(qwen3_code_predictor.CodePredictorAttenti
         sin = sin.unsqueeze(1)
         import torch_npu
 
+        # Use the fused Ascend RoPE op instead of expanding RoPE into
+        # elementwise mul/add/rotate-half kernels.
         q = torch_npu.npu_rotary_mul(q, cos, sin)
         k = torch_npu.npu_rotary_mul(k, cos, sin)
 
@@ -203,6 +228,8 @@ class _Qwen3CodePredictorAttention310P(qwen3_code_predictor.CodePredictorAttenti
 
         from vllm_ascend.utils import aligned_16
 
+        # 310P flash attention consumes token-major fp16 inputs with 16-token
+        # alignment; seq_lens carries the padding information.
         q_f = aligned_16(q.to(torch.float16).transpose(1, 2).reshape(real_tokens, self.num_heads, self.head_dim))
         k_f = aligned_16(k.to(torch.float16).transpose(1, 2).reshape(real_tokens, self.num_kv_heads, self.head_dim))
         v_f = aligned_16(v.to(torch.float16).transpose(1, 2).reshape(real_tokens, self.num_kv_heads, self.head_dim))
@@ -229,6 +256,13 @@ class _Qwen3CodePredictorAttention310P(qwen3_code_predictor.CodePredictorAttenti
 
 
 class _Qwen3CodePredictorDecoderLayer310P(qwen3_code_predictor.CodePredictorDecoderLayer):
+    """Decoder layer override with fused residual RMSNorm.
+
+    Profiling shows the residual add followed by RMSNorm as a cluster of small
+    kernels on 310P.  ``npu_add_rms_norm`` matches this pattern directly and
+    reduces graph-captured launch work in each CodePredictor layer.
+    """
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -240,9 +274,7 @@ class _Qwen3CodePredictorDecoderLayer310P(qwen3_code_predictor.CodePredictorDeco
         hidden_states = self.self_attn(hidden_states, position_embeddings, attention_mask=attention_mask)
         import torch_npu
 
-        # Fuse the residual add and post-attention RMSNorm.  310P has an
-        # efficient NPU kernel for this pattern, while the generic PyTorch
-        # expression expands into multiple elementwise kernels.
+        # Fuse the residual add and post-attention RMSNorm for 310P.
         hidden_states, _, residual = torch_npu.npu_add_rms_norm(
             hidden_states,
             residual,
@@ -253,6 +285,13 @@ class _Qwen3CodePredictorDecoderLayer310P(qwen3_code_predictor.CodePredictorDeco
 
 
 class _Qwen3CodePredictorBaseModel310P(qwen3_code_predictor.CodePredictorBaseModel):
+    """Base model override with a cached 310P causal mask.
+
+    The 310P flash-attention path consumes the additive causal mask in
+    FRACTAL_NZ format.  The CodePredictor sequence length is fixed and short,
+    so the mask is built once and reused across graph replays.
+    """
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._attention_mask_310p = None
@@ -268,6 +307,8 @@ class _Qwen3CodePredictorBaseModel310P(qwen3_code_predictor.CodePredictorBaseMod
             return super().forward(inputs_embeds, position_ids)
 
         if self._attention_mask_310p is None or self._attention_mask_310p_device != inputs_embeds.device:
+            # Store the additive causal mask in the format consumed by the
+            # 310P flash-attention kernel.
             import torch_npu
             from vllm_ascend._310p.attention.attention_mask import AttentionMaskBuilder310
             from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, nd_to_nz_2d
@@ -292,8 +333,22 @@ class _Qwen3CodePredictorBaseModel310P(qwen3_code_predictor.CodePredictorBaseMod
         return hidden_states.to(input_dtype)
 
 
+# ===================================================================
+#  CodePredictorWrapper setup and forward patches
+# ===================================================================
+#
+# These helpers patch the wrapper rather than the shared model file.  They
+# keep 310P-specific weight layout conversion and AR-loop algebraic folding out
+# of the generic CodePredictor implementation.
+
+
 def _maybe_transform_linears_for_310p(module: nn.Module, *, log_prefix: str, attr_name: str) -> None:
-    """Persistently convert Linear weights to the 310P matmul-friendly layout."""
+    """Convert Linear weights once to the 310P matmul-friendly layout.
+
+    Profiling showed ``TransData`` immediately before CodePredictor matmuls
+    when weights stayed in ND format.  Persisting the converted weight avoids
+    repeated ND->NZ conversion inside the captured loop.
+    """
     if getattr(module, attr_name, False):
         return
 
@@ -311,6 +366,13 @@ def _maybe_transform_linears_for_310p(module: nn.Module, *, log_prefix: str, att
 
 
 def _build_projected_codec_embed_weight_310p(self) -> None:
+    """Pre-fold codec embedding tables through the MTP projection.
+
+    Each residual-code step used to execute ``Embedding -> Linear``.  Since the
+    embedding tables are static after loading, applying the projection once
+    turns the per-step work into a single table lookup.
+    """
+
     if not hasattr(self, "_projected_codec_embed_weight"):
         self.register_buffer("_projected_codec_embed_weight", None, persistent=False)
 
@@ -330,6 +392,13 @@ def _build_projected_codec_embed_weight_310p(self) -> None:
 
 
 def _setup_compile_310p(self) -> None:
+    """CodePredictor setup override for 310P graph capture.
+
+    This mirrors the shared wrapper setup, then applies the 310P-only weight
+    layout conversion and projected embedding table construction before warmup
+    and NPU graph capture.
+    """
+
     if self._compiled_model_fwd is not None:
         return
 
@@ -381,6 +450,13 @@ def _code_predictor_forward_310p(
     top_p: float = 1.0,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """CodePredictor forward override with pre-projected codec embeddings.
+
+    The control flow follows the shared wrapper forward.  The 310P-specific
+    fast path replaces the per-step projection matmul with a lookup into the
+    pre-projected codec embedding table.
+    """
+
     if layer0_code.device.type != "npu":
         assert _ORIGINAL_CODE_PREDICTOR_FORWARD is not None
         return _ORIGINAL_CODE_PREDICTOR_FORWARD(
@@ -493,6 +569,8 @@ def _code_predictor_forward_310p(
 
         if step < num_groups - 1 or self._wrapper_config.return_proj_buf:
             if projected_codec_embed_weight is not None:
+                # The table already has CodePredictor hidden size; avoid the
+                # per-step projection matmul in the autoregressive loop.
                 proj_buf[:bsz, step + 1, :].copy_(
                     F.embedding(code.reshape(-1), projected_codec_embed_weight[step - 1])
                 )
@@ -507,7 +585,19 @@ def _code_predictor_forward_310p(
     return all_codes
 
 
+# ===================================================================
+#  Patch registration
+# ===================================================================
+
+
 def apply_talker_patches() -> None:
+    """Install Qwen3-TTS Talker and CodePredictor 310P patches.
+
+    The generic model modules stay unchanged.  Patch registration swaps in the
+    310P-specialized CodePredictor classes and wrapper methods only when the
+    310P platform applies the Talker patch.
+    """
+
     global _PATCHED
     global _ORIGINAL_CODE_PREDICTOR_SETUP_COMPILE
     global _ORIGINAL_CODE_PREDICTOR_FORWARD
