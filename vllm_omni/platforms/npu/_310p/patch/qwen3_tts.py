@@ -46,7 +46,12 @@ class _Qwen3TTSTalker310P(qwen3_tts_talker.Qwen3TTSTalkerForConditionalGeneratio
 
     def load_weights(self, weights):
         loaded = super().load_weights(weights)
-        self.encoder.to(dtype=_RUNTIME_DTYPE)
+        # The Mimi tokenizer encoder is used only while building ref_audio
+        # prompts.  On 310P, its NPU path can hit an AICore fault in the
+        # variable-length padding/conv stack on the second request with a
+        # different reference clip, so keep this preprocessing-only module on
+        # CPU and return the generated codes to the serving device afterwards.
+        self.encoder.to(device=_CPU_DEVICE, dtype=torch.float32)
         return loaded
 
     def _encode_ref_audio_batch(
@@ -62,7 +67,7 @@ class _Qwen3TTSTalker310P(qwen3_tts_talker.Qwen3TTSTalkerForConditionalGeneratio
             resampler = AudioResampler(target_sr=target_sr)
             wavs = [resampler.resample(w.astype(np.float32), orig_sr=int(sr)) for w in wavs]
 
-        inputs = fe(raw_audio=wavs, sampling_rate=target_sr, return_tensors="pt").to(device).to(_RUNTIME_DTYPE)
+        inputs = fe(raw_audio=wavs, sampling_rate=target_sr, return_tensors="pt").to(_CPU_DEVICE).to(torch.float32)
 
         with torch.inference_mode():
             encoded = self.encoder.encode(
