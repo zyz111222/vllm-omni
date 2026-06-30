@@ -19,6 +19,9 @@ from vllm_omni.model_executor.models.qwen3_tts import (
     qwen3_tts_code_predictor_vllm,
     qwen3_tts_talker,
 )
+from vllm_ascend._310p.attention.attention_mask import AttentionMaskBuilder310
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, aligned_16, maybe_trans_nz, nd_to_nz_2d
+import torch_npu
 
 _RUNTIME_DTYPE = torch.float16
 _CPU_DEVICE = torch.device("cpu")
@@ -220,8 +223,6 @@ class _Qwen3CodePredictorAttention310P(qwen3_code_predictor.CodePredictorAttenti
         cos, sin = position_embeddings
         cos = cos.unsqueeze(1)
         sin = sin.unsqueeze(1)
-        import torch_npu
-
         # Use the fused Ascend RoPE op instead of expanding RoPE into
         # elementwise mul/add/rotate-half kernels.
         q = torch_npu.npu_rotary_mul(q, cos, sin)
@@ -230,13 +231,11 @@ class _Qwen3CodePredictorAttention310P(qwen3_code_predictor.CodePredictorAttenti
         real_tokens = int(bsz) * int(seq_len)
         output_dtype = q.dtype
 
-        from vllm_ascend.utils import aligned_16
-
         # 310P flash attention consumes token-major fp16 inputs with 16-token
         # alignment; seq_lens carries the padding information.
-        q_f = aligned_16(q.to(torch.float16).transpose(1, 2).reshape(real_tokens, self.num_heads, self.head_dim))
-        k_f = aligned_16(k.to(torch.float16).transpose(1, 2).reshape(real_tokens, self.num_kv_heads, self.head_dim))
-        v_f = aligned_16(v.to(torch.float16).transpose(1, 2).reshape(real_tokens, self.num_kv_heads, self.head_dim))
+        q_f = aligned_16(q.transpose(1, 2).reshape(real_tokens, self.num_heads, self.head_dim))
+        k_f = aligned_16(k.transpose(1, 2).reshape(real_tokens, self.num_kv_heads, self.head_dim))
+        v_f = aligned_16(v.transpose(1, 2).reshape(real_tokens, self.num_kv_heads, self.head_dim))
 
         aligned_tokens = int(q_f.shape[0])
         seq_lens = torch.full((int(bsz),), int(seq_len), dtype=torch.int32, device="cpu")
@@ -276,8 +275,6 @@ class _Qwen3CodePredictorDecoderLayer310P(qwen3_code_predictor.CodePredictorDeco
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(hidden_states, position_embeddings, attention_mask=attention_mask)
-        import torch_npu
-
         # Fuse the residual add and post-attention RMSNorm for 310P.
         hidden_states, _, residual = torch_npu.npu_add_rms_norm(
             hidden_states,
@@ -313,10 +310,6 @@ class _Qwen3CodePredictorBaseModel310P(qwen3_code_predictor.CodePredictorBaseMod
         if self._attention_mask_310p is None or self._attention_mask_310p_device != inputs_embeds.device:
             # Store the additive causal mask in the format consumed by the
             # 310P flash-attention kernel.
-            import torch_npu
-            from vllm_ascend._310p.attention.attention_mask import AttentionMaskBuilder310
-            from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, nd_to_nz_2d
-
             mask = AttentionMaskBuilder310.gen_causal_additive_mask(
                 self._attention_mask_310p_max_seq,
                 inputs_embeds.device,
@@ -362,8 +355,6 @@ class _Qwen3TTSTalkerCodePredictor310P(
     def _prepare_static_weights_310p(self) -> None:
         if self._static_310p_ready:
             return
-
-        from vllm_ascend.utils import maybe_trans_nz
 
         self._lm_heads_list = list(self.lm_head)
         self._codec_embeds_list = list(self.model.codec_embedding)
