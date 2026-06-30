@@ -52,6 +52,7 @@ class _Qwen3TTSTalker310P(qwen3_tts_talker.Qwen3TTSTalkerForConditionalGeneratio
         # different reference clip, so keep this preprocessing-only module on
         # CPU and return the generated codes to the serving device afterwards.
         self.encoder.to(device=_CPU_DEVICE, dtype=torch.float32)
+        _prepare_code_predictor_static_310p(self.code_predictor)
         return loaded
 
     def _encode_ref_audio_batch(
@@ -377,6 +378,8 @@ def _build_projected_codec_embed_weight_310p(self) -> None:
     embedding tables are static after loading, applying the projection once
     turns the per-step work into a single table lookup.
     """
+    if getattr(self, "_projected_codec_embed_weight_built_for_310p", False):
+        return
 
     if not hasattr(self, "_projected_codec_embed_weight"):
         self.register_buffer("_projected_codec_embed_weight", None, persistent=False)
@@ -384,6 +387,7 @@ def _build_projected_codec_embed_weight_310p(self) -> None:
     codec_embeds = self._codec_embeds_list
     if codec_embeds is None or self._wrapper_config.use_parallel_embedding:
         self._projected_codec_embed_weight = None
+        self._projected_codec_embed_weight_built_for_310p = True
         return
 
     projected_weights: list[torch.Tensor] = []
@@ -391,9 +395,30 @@ def _build_projected_codec_embed_weight_310p(self) -> None:
         for embed_layer in codec_embeds:
             if not isinstance(embed_layer, nn.Embedding):
                 self._projected_codec_embed_weight = None
+                self._projected_codec_embed_weight_built_for_310p = True
                 return
             projected_weights.append(self.small_to_mtp_projection(embed_layer.weight).detach())
     self._projected_codec_embed_weight = torch.stack(projected_weights, dim=0).contiguous()
+    self._projected_codec_embed_weight_built_for_310p = True
+
+
+def _prepare_code_predictor_static_310p(self) -> None:
+    """Prepare static CodePredictor weights/tables before graph capture.
+
+    The generic wrapper initializes these lazily in ``forward``.  On 310P, doing
+    the same would put one-time ND->NZ weight conversions and codec-table
+    projection into the first profiled request, so the talker calls this right
+    after weights are loaded.  ``_setup_compile_310p`` calls it again as a
+    no-op fallback for code paths that bypass the talker loader.
+    """
+    self._lm_heads_list = list(self.lm_head)
+    self._codec_embeds_list = list(self.model.codec_embedding)
+    _maybe_transform_linears_for_310p(
+        self,
+        log_prefix="code_predictor",
+        attr_name="_linear_weights_transformed_for_310p",
+    )
+    _build_projected_codec_embed_weight_310p(self)
 
 
 def _setup_compile_310p(self) -> None:
@@ -409,15 +434,7 @@ def _setup_compile_310p(self) -> None:
 
     self._model_dtype = next(self.model.parameters()).dtype
     self.model.rotary_emb.to(device=next(self.model.parameters()).device, dtype=self._model_dtype)
-    self._lm_heads_list = list(self.lm_head)
-    self._codec_embeds_list = list(self.model.codec_embedding)
-
-    _maybe_transform_linears_for_310p(
-        self,
-        log_prefix="code_predictor",
-        attr_name="_linear_weights_transformed_for_310p",
-    )
-    _build_projected_codec_embed_weight_310p(self)
+    _prepare_code_predictor_static_310p(self)
 
     if not qwen3_code_predictor.current_omni_platform.supports_torch_inductor():
         self._compiled_model_fwd = self.model.forward
@@ -495,8 +512,19 @@ def _code_predictor_forward_310p(
     projected_codec_embed_weight = getattr(self, "_projected_codec_embed_weight", None)
 
     proj_buf[:padded_bsz].zero_()
-    proj_buf[:bsz, 0, :] = projection(last_talker_hidden.reshape(bsz, 1, -1).to(dtype)).reshape(bsz, -1)
-    proj_buf[:bsz, 1, :] = projection(layer0_embed.reshape(bsz, 1, -1).to(dtype)).reshape(bsz, -1)
+    # Project the two fixed prefix tokens in one Linear call.  The caller
+    # already prepares fp16 inputs on 310P; keep the dtype guard only for
+    # non-standard paths so this does not introduce an extra cast/copy.
+    initial_embeds = torch.cat(
+        (
+            last_talker_hidden.reshape(bsz, 1, -1),
+            layer0_embed.reshape(bsz, 1, -1),
+        ),
+        dim=1,
+    )
+    if initial_embeds.dtype != dtype:
+        initial_embeds = initial_embeds.to(dtype=dtype)
+    proj_buf[:bsz, :2, :].copy_(projection(initial_embeds))
 
     stored_mode = self._wrapper_config.sampling_mode == "stored"
     if stored_mode:
