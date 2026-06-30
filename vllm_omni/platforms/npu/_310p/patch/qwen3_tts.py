@@ -16,14 +16,13 @@ from vllm.multimodal.audio import AudioResampler
 from vllm_omni.model_executor.models.common import qwen3_code_predictor
 from vllm_omni.model_executor.models.qwen3_tts import (
     prompt_embeds_builder,
+    qwen3_tts_code_predictor_vllm,
     qwen3_tts_talker,
 )
 
 _RUNTIME_DTYPE = torch.float16
 _CPU_DEVICE = torch.device("cpu")
 _PATCHED = False
-_ORIGINAL_CODE_PREDICTOR_SETUP_COMPILE = None
-_ORIGINAL_CODE_PREDICTOR_FORWARD = None
 
 logger = init_logger(__name__)
 
@@ -52,7 +51,6 @@ class _Qwen3TTSTalker310P(qwen3_tts_talker.Qwen3TTSTalkerForConditionalGeneratio
         # different reference clip, so keep this preprocessing-only module on
         # CPU and return the generated codes to the serving device afterwards.
         self.encoder.to(device=_CPU_DEVICE, dtype=torch.float32)
-        _prepare_code_predictor_static_310p(self.code_predictor)
         return loaded
 
     def _encode_ref_audio_batch(
@@ -339,283 +337,225 @@ class _Qwen3CodePredictorBaseModel310P(qwen3_code_predictor.CodePredictorBaseMod
         return hidden_states.to(input_dtype)
 
 
-# ===================================================================
-#  CodePredictorWrapper setup and forward patches
-# ===================================================================
-#
-# These helpers patch the wrapper rather than the shared model file.  They
-# keep 310P-specific weight layout conversion and AR-loop algebraic folding out
-# of the generic CodePredictor implementation.
+class _Qwen3TTSTalkerCodePredictor310P(
+    qwen3_tts_code_predictor_vllm.Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
+):
+    """Qwen3-TTS code predictor specialized for the 310P NPU path."""
 
-
-def _maybe_transform_linears_for_310p(module: nn.Module, *, log_prefix: str, attr_name: str) -> None:
-    """Convert Linear weights once to the 310P matmul-friendly layout.
-
-    Profiling showed ``TransData`` immediately before CodePredictor matmuls
-    when weights stayed in ND format.  Persisting the converted weight avoids
-    repeated ND->NZ conversion inside the captured loop.
-    """
-    if getattr(module, attr_name, False):
-        return
-
-    from vllm_ascend.utils import maybe_trans_nz
-
-    transformed = 0
-    with torch.no_grad():
-        for child in module.modules():
-            if isinstance(child, nn.Linear):
-                child.weight.data = maybe_trans_nz(child.weight.data)
-                transformed += 1
-    setattr(module, attr_name, True)
-    if transformed:
-        logger.info_once("%s: transformed %d Linear weights for 310P layout", log_prefix, transformed)
-
-
-def _build_projected_codec_embed_weight_310p(self) -> None:
-    """Pre-fold codec embedding tables through the MTP projection.
-
-    Each residual-code step used to execute ``Embedding -> Linear``.  Since the
-    embedding tables are static after loading, applying the projection once
-    turns the per-step work into a single table lookup.
-    """
-    if getattr(self, "_projected_codec_embed_weight_built_for_310p", False):
-        return
-
-    if not hasattr(self, "_projected_codec_embed_weight"):
-        self.register_buffer("_projected_codec_embed_weight", None, persistent=False)
-
-    codec_embeds = self._codec_embeds_list
-    if codec_embeds is None or self._wrapper_config.use_parallel_embedding:
-        self._projected_codec_embed_weight = None
-        self._projected_codec_embed_weight_built_for_310p = True
-        return
-
-    projected_weights: list[torch.Tensor] = []
-    with torch.no_grad():
-        for embed_layer in codec_embeds:
-            if not isinstance(embed_layer, nn.Embedding):
-                self._projected_codec_embed_weight = None
-                self._projected_codec_embed_weight_built_for_310p = True
-                return
-            projected_weights.append(self.small_to_mtp_projection(embed_layer.weight).detach())
-    self._projected_codec_embed_weight = torch.stack(projected_weights, dim=0).contiguous()
-    self._projected_codec_embed_weight_built_for_310p = True
-
-
-def _prepare_code_predictor_static_310p(self) -> None:
-    """Prepare static CodePredictor weights/tables before graph capture.
-
-    The generic wrapper initializes these lazily in ``forward``.  On 310P, doing
-    the same would put one-time ND->NZ weight conversions and codec-table
-    projection into the first profiled request, so the talker calls this right
-    after weights are loaded.  ``_setup_compile_310p`` calls it again as a
-    no-op fallback for code paths that bypass the talker loader.
-    """
-    self._lm_heads_list = list(self.lm_head)
-    self._codec_embeds_list = list(self.model.codec_embedding)
-    _maybe_transform_linears_for_310p(
+    def __init__(
         self,
-        log_prefix="code_predictor",
-        attr_name="_linear_weights_transformed_for_310p",
-    )
-    _build_projected_codec_embed_weight_310p(self)
-
-
-def _setup_compile_310p(self) -> None:
-    """CodePredictor setup override for 310P graph capture.
-
-    This mirrors the shared wrapper setup, then applies the 310P-only weight
-    layout conversion and projected embedding table construction before warmup
-    and NPU graph capture.
-    """
-
-    if self._compiled_model_fwd is not None:
-        return
-
-    self._model_dtype = next(self.model.parameters()).dtype
-    self.model.rotary_emb.to(device=next(self.model.parameters()).device, dtype=self._model_dtype)
-    _prepare_code_predictor_static_310p(self)
-
-    if not qwen3_code_predictor.current_omni_platform.supports_torch_inductor():
-        self._compiled_model_fwd = self.model.forward
-        if qwen3_code_predictor.current_omni_platform.is_npu() and self._wrapper_config.use_cuda_graphs:
-            self._warmup_buckets()
-            self._capture_npu_graphs()
-            logger.info("code_predictor: eager mode + NPU graphs")
-        else:
-            logger.warning_once("code_predictor: torch.compile disabled")
-        return
-
-    self._compiled_model_fwd = torch.compile(
-        self.model.forward,
-        dynamic=False,
-        options={"epilogue_fusion": False},
-    )
-    self._warmup_buckets()
-
-    if self._wrapper_config.use_cuda_graphs:
-        self._capture_cuda_graphs()
-        logger.info("code_predictor: torch.compile (no epilogue fusion) + CUDA graphs")
-    else:
-        logger.info("code_predictor: torch.compile (dynamic=False, no epilogue fusion)")
-
-
-@torch.inference_mode()
-def _code_predictor_forward_310p(
-    self,
-    layer0_code: torch.Tensor,
-    layer0_embed: torch.Tensor,
-    last_talker_hidden: torch.Tensor,
-    do_sample: bool = True,
-    temperature: float = 0.9,
-    top_k: int = 50,
-    top_p: float = 1.0,
-    generator: torch.Generator | None = None,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """CodePredictor forward override with pre-projected codec embeddings.
-
-    The control flow follows the shared wrapper forward.  The 310P-specific
-    fast path replaces the per-step projection matmul with a lookup into the
-    pre-projected codec embedding table.
-    """
-
-    if layer0_code.device.type != "npu":
-        assert _ORIGINAL_CODE_PREDICTOR_FORWARD is not None
-        return _ORIGINAL_CODE_PREDICTOR_FORWARD(
-            self,
-            layer0_code,
-            layer0_embed,
-            last_talker_hidden,
-            do_sample=do_sample,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            generator=generator,
+        *,
+        vllm_config,
+        config,
+        talker_config,
+        prefix: str = "code_predictor",
+    ) -> None:
+        super().__init__(
+            vllm_config=vllm_config,
+            config=config,
+            talker_config=talker_config,
+            prefix=prefix,
         )
+        self._static_310p_ready = False
+        self._projected_codec_embed_weight = None
 
-    bsz = int(layer0_code.shape[0])
-    num_groups = self._num_groups
-    device = layer0_code.device
+    def _prepare_static_weights_310p(self) -> None:
+        if self._static_310p_ready:
+            return
 
-    self._setup_compile()
-    dtype = self._model_dtype
+        from vllm_ascend.utils import maybe_trans_nz
 
-    padded_bsz = self._padded_bsz(bsz)
-    self._ensure_buffers(device, dtype, padded_bsz)
+        self._lm_heads_list = list(self.lm_head)
+        self._codec_embeds_list = list(self.model.codec_embedding)
 
-    proj_buf = self._proj_buf
-    max_seq = num_groups + 1
-    projection = self.small_to_mtp_projection
-    model_fwd = self._compiled_model_fwd
-    lm_heads = self._lm_heads_list
-    codec_embeds = self._codec_embeds_list
-    projected_codec_embed_weight = getattr(self, "_projected_codec_embed_weight", None)
+        with torch.no_grad():
+            for child in self.modules():
+                if isinstance(child, nn.Linear):
+                    child.weight.data = maybe_trans_nz(child.weight.data)
 
-    proj_buf[:padded_bsz].zero_()
-    # Project the two fixed prefix tokens in one Linear call.  The caller
-    # already prepares fp16 inputs on 310P; keep the dtype guard only for
-    # non-standard paths so this does not introduce an extra cast/copy.
-    initial_embeds = torch.cat(
-        (
-            last_talker_hidden.reshape(bsz, 1, -1),
-            layer0_embed.reshape(bsz, 1, -1),
-        ),
-        dim=1,
-    )
-    if initial_embeds.dtype != dtype:
-        initial_embeds = initial_embeds.to(dtype=dtype)
-    proj_buf[:bsz, :2, :].copy_(projection(initial_embeds))
+            if not self._wrapper_config.use_parallel_embedding:
+                self._projected_codec_embed_weight = torch.stack(
+                    [self.small_to_mtp_projection(embed.weight).detach() for embed in self._codec_embeds_list],
+                    dim=0,
+                ).contiguous()
 
-    stored_mode = self._wrapper_config.sampling_mode == "stored"
-    if stored_mode:
-        s_top_k = self._top_k
-        s_top_p = self._top_p
-    else:
-        use_sampling = do_sample and temperature > 0
-        inv_temperature = 1.0 / max(temperature, 1e-6) if use_sampling else 0.0
-        if use_sampling and top_p != 1.0:
-            raise NotImplementedError(
-                "top_p sampling is not implemented for the vLLM-native code predictor; please set top_p=1.0."
-            )
+        self._static_310p_ready = True
 
-    if self._wrapper_config.return_proj_buf:
-        all_codes = torch.empty(bsz, num_groups, 1, dtype=torch.int64, device=device)
-        all_codes[:, 0] = layer0_code.reshape(bsz, -1)[:, :1]
-    else:
-        all_codes = torch.empty(bsz, num_groups, dtype=torch.long, device=device)
-        all_codes[:, 0] = layer0_code.reshape(bsz)
+    def load_weights(self, weights):
+        loaded = super().load_weights(weights)
+        self._prepare_static_weights_310p()
+        return loaded
 
-    for step in range(1, num_groups):
-        graph_key: int | tuple[int, int] = padded_bsz
-        seq_len = max_seq
-        if self._prefix_graphs_enabled:
-            prefix_key = (padded_bsz, step + 1)
-            if prefix_key in self._device_graphs:
-                graph_key = prefix_key
-                seq_len = step + 1
-        pos_ids = self._bucket_pos_ids.get(graph_key)
-        if pos_ids is None:
-            pos_ids = (
-                torch.arange(seq_len, device=device, dtype=torch.long)
-                .unsqueeze(0)
-                .expand(padded_bsz, -1)
-                .contiguous()
-            )
+    def _setup_compile(self) -> None:
+        if self._compiled_model_fwd is not None:
+            return
 
-        device_graph_entry = self._device_graphs.get(graph_key)
-        if device_graph_entry is not None:
-            device_graph_entry[0].replay()
-            hidden_out = device_graph_entry[1]
-        else:
-            hidden_out = model_fwd(proj_buf[:padded_bsz, :seq_len, :], pos_ids)
+        param = next(self.model.parameters())
+        self._model_dtype = param.dtype
+        self.model.rotary_emb.to(device=param.device, dtype=self._model_dtype)
+        self._prepare_static_weights_310p()
 
-        logits = lm_heads[step - 1](hidden_out[:bsz, step, :])
-
-        if stored_mode:
-            if s_top_k > 0:
-                topk_vals, _ = logits.topk(s_top_k, dim=-1)
-                logits = logits.masked_fill(logits < topk_vals[:, -1:], float("-inf"))
-            if s_top_p < 1.0:
-                sorted_logits, sorted_idx = logits.sort(dim=-1, descending=True)
-                sorted_probs = F.softmax(sorted_logits, dim=-1, dtype=torch.float32)
-                cumulative_probs = sorted_probs.cumsum(dim=-1)
-                remove_mask = (cumulative_probs - sorted_probs) >= s_top_p
-                sorted_logits[remove_mask] = float("-inf")
-                logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
-            probs = F.softmax(logits, dim=-1, dtype=torch.float32)
-            code = torch.multinomial(probs, num_samples=1, generator=generator)
-        else:
-            if use_sampling:
-                scaled = logits * inv_temperature
-                if top_k > 0:
-                    topk_vals, _ = scaled.topk(top_k, dim=-1)
-                    scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
-                probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
-                code = torch.multinomial(probs, num_samples=1, generator=generator)
+        if not qwen3_code_predictor.current_omni_platform.supports_torch_inductor():
+            self._compiled_model_fwd = self.model.forward
+            if qwen3_code_predictor.current_omni_platform.is_npu() and self._wrapper_config.use_cuda_graphs:
+                self._warmup_buckets()
+                self._capture_npu_graphs()
+                logger.info("code_predictor: eager mode + NPU graphs")
             else:
-                code = logits.argmax(dim=-1, keepdim=True)
+                logger.warning_once("code_predictor: torch.compile disabled")
+            return
+
+        self._compiled_model_fwd = torch.compile(
+            self.model.forward,
+            dynamic=False,
+            options={"epilogue_fusion": False},
+        )
+        self._warmup_buckets()
+
+        if self._wrapper_config.use_cuda_graphs:
+            self._capture_cuda_graphs()
+            logger.info("code_predictor: torch.compile (no epilogue fusion) + CUDA graphs")
+        else:
+            logger.info("code_predictor: torch.compile (dynamic=False, no epilogue fusion)")
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        layer0_code: torch.Tensor,
+        layer0_embed: torch.Tensor,
+        last_talker_hidden: torch.Tensor,
+        do_sample: bool = True,
+        temperature: float = 0.9,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if layer0_code.device.type != "npu":
+            return super().forward(
+                layer0_code,
+                layer0_embed,
+                last_talker_hidden,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                generator=generator,
+            )
+
+        bsz = int(layer0_code.shape[0])
+        num_groups = self._num_groups
+        device = layer0_code.device
+
+        self._setup_compile()
+        dtype = self._model_dtype
+
+        padded_bsz = self._padded_bsz(bsz)
+        self._ensure_buffers(device, dtype, padded_bsz)
+
+        proj_buf = self._proj_buf
+        max_seq = num_groups + 1
+        projection = self.small_to_mtp_projection
+        model_fwd = self._compiled_model_fwd
+        lm_heads = self._lm_heads_list
+        codec_embeds = self._codec_embeds_list
+        projected_codec_embed_weight = self._projected_codec_embed_weight
+
+        proj_buf[:padded_bsz].zero_()
+        initial_embeds = torch.cat(
+            (
+                last_talker_hidden.reshape(bsz, 1, -1),
+                layer0_embed.reshape(bsz, 1, -1),
+            ),
+            dim=1,
+        )
+        proj_buf[:bsz, :2, :].copy_(projection(initial_embeds))
+
+        stored_mode = self._wrapper_config.sampling_mode == "stored"
+        if stored_mode:
+            s_top_k = self._top_k
+            s_top_p = self._top_p
+        else:
+            use_sampling = do_sample and temperature > 0
+            inv_temperature = 1.0 / max(temperature, 1e-6) if use_sampling else 0.0
+            if use_sampling and top_p != 1.0:
+                raise NotImplementedError(
+                    "top_p sampling is not implemented for the vLLM-native code predictor; please set top_p=1.0."
+                )
 
         if self._wrapper_config.return_proj_buf:
-            all_codes[:, step] = code
+            all_codes = torch.empty(bsz, num_groups, 1, dtype=torch.int64, device=device)
+            all_codes[:, 0] = layer0_code.reshape(bsz, -1)[:, :1]
         else:
-            all_codes[:, step] = code.reshape(bsz)
+            all_codes = torch.empty(bsz, num_groups, dtype=torch.long, device=device)
+            all_codes[:, 0] = layer0_code.reshape(bsz)
 
-        if step < num_groups - 1 or self._wrapper_config.return_proj_buf:
-            if projected_codec_embed_weight is not None:
-                # The table already has CodePredictor hidden size; avoid the
-                # per-step projection matmul in the autoregressive loop.
-                proj_buf[:bsz, step + 1, :].copy_(
-                    F.embedding(code.reshape(-1), projected_codec_embed_weight[step - 1])
+        for step in range(1, num_groups):
+            graph_key: int | tuple[int, int] = padded_bsz
+            seq_len = max_seq
+            if self._prefix_graphs_enabled:
+                prefix_key = (padded_bsz, step + 1)
+                if prefix_key in self._device_graphs:
+                    graph_key = prefix_key
+                    seq_len = step + 1
+            pos_ids = self._bucket_pos_ids.get(graph_key)
+            if pos_ids is None:
+                pos_ids = (
+                    torch.arange(seq_len, device=device, dtype=torch.long)
+                    .unsqueeze(0)
+                    .expand(padded_bsz, -1)
+                    .contiguous()
                 )
+
+            device_graph_entry = self._device_graphs.get(graph_key)
+            if device_graph_entry is not None:
+                device_graph_entry[0].replay()
+                hidden_out = device_graph_entry[1]
             else:
-                new_embed = codec_embeds[step - 1](code)
-                proj_buf[:bsz, step + 1, :].copy_(
-                    projection(new_embed.reshape(bsz, 1, -1)).reshape(bsz, -1)
-                )
+                hidden_out = model_fwd(proj_buf[:padded_bsz, :seq_len, :], pos_ids)
 
-    if self._wrapper_config.return_proj_buf:
-        return all_codes, proj_buf[:bsz].clone()
-    return all_codes
+            logits = lm_heads[step - 1](hidden_out[:bsz, step, :])
+
+            if stored_mode:
+                if s_top_k > 0:
+                    topk_vals, _ = logits.topk(s_top_k, dim=-1)
+                    logits = logits.masked_fill(logits < topk_vals[:, -1:], float("-inf"))
+                if s_top_p < 1.0:
+                    sorted_logits, sorted_idx = logits.sort(dim=-1, descending=True)
+                    sorted_probs = F.softmax(sorted_logits, dim=-1, dtype=torch.float32)
+                    cumulative_probs = sorted_probs.cumsum(dim=-1)
+                    remove_mask = (cumulative_probs - sorted_probs) >= s_top_p
+                    sorted_logits[remove_mask] = float("-inf")
+                    logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
+                probs = F.softmax(logits, dim=-1, dtype=torch.float32)
+                code = torch.multinomial(probs, num_samples=1, generator=generator)
+            else:
+                if use_sampling:
+                    scaled = logits * inv_temperature
+                    if top_k > 0:
+                        topk_vals, _ = scaled.topk(top_k, dim=-1)
+                        scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
+                    probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
+                    code = torch.multinomial(probs, num_samples=1, generator=generator)
+                else:
+                    code = logits.argmax(dim=-1, keepdim=True)
+
+            if self._wrapper_config.return_proj_buf:
+                all_codes[:, step] = code
+            else:
+                all_codes[:, step] = code.reshape(bsz)
+
+            if step < num_groups - 1 or self._wrapper_config.return_proj_buf:
+                if projected_codec_embed_weight is not None:
+                    proj_buf[:bsz, step + 1, :].copy_(
+                        F.embedding(code.reshape(-1), projected_codec_embed_weight[step - 1])
+                    )
+                else:
+                    new_embed = codec_embeds[step - 1](code)
+                    proj_buf[:bsz, step + 1, :].copy_(projection(new_embed.reshape(bsz, 1, -1)).reshape(bsz, -1))
+
+        if self._wrapper_config.return_proj_buf:
+            return all_codes, proj_buf[:bsz].clone()
+        return all_codes
 
 
 # ===================================================================
@@ -632,8 +572,6 @@ def apply_talker_patches() -> None:
     """
 
     global _PATCHED
-    global _ORIGINAL_CODE_PREDICTOR_SETUP_COMPILE
-    global _ORIGINAL_CODE_PREDICTOR_FORWARD
 
     if _PATCHED:
         return
@@ -641,16 +579,19 @@ def apply_talker_patches() -> None:
     modeling_mimi.MimiEuclideanCodebook = _MimiEuclideanCodebook310P
     qwen3_tts_talker.Qwen3TTSTalkerForConditionalGeneration = _Qwen3TTSTalker310P
     qwen3_tts_talker.Qwen3TTSPromptEmbedsBuilder = _Qwen3TTSPromptEmbedsBuilder310P
+    qwen3_tts_talker.Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM = _Qwen3TTSTalkerCodePredictor310P
+    qwen3_tts_code_predictor_vllm.Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM = (
+        _Qwen3TTSTalkerCodePredictor310P
+    )
+    qwen3_tts_code_predictor_vllm.CodePredictorBaseModel = _Qwen3CodePredictorBaseModel310P
+    qwen3_tts_code_predictor_vllm.Qwen3TTSTalkerCodePredictorModelVLLM = _Qwen3CodePredictorBaseModel310P
+    qwen3_tts_code_predictor_vllm.CodePredictorWrapper = _Qwen3TTSTalkerCodePredictor310P
     prompt_embeds_builder.Qwen3TTSPromptEmbedsBuilder = _Qwen3TTSPromptEmbedsBuilder310P
     qwen3_code_predictor._RMSNorm = _RMSNorm310P
     qwen3_code_predictor._RotaryEmbedding = _RotaryEmbedding310P
     qwen3_code_predictor.CodePredictorAttention = _Qwen3CodePredictorAttention310P
     qwen3_code_predictor.CodePredictorDecoderLayer = _Qwen3CodePredictorDecoderLayer310P
     qwen3_code_predictor.CodePredictorBaseModel = _Qwen3CodePredictorBaseModel310P
-
-    _ORIGINAL_CODE_PREDICTOR_SETUP_COMPILE = qwen3_code_predictor.CodePredictorWrapper._setup_compile
-    _ORIGINAL_CODE_PREDICTOR_FORWARD = qwen3_code_predictor.CodePredictorWrapper.forward
-    qwen3_code_predictor.CodePredictorWrapper._setup_compile = _setup_compile_310p
-    qwen3_code_predictor.CodePredictorWrapper.forward = _code_predictor_forward_310p
+    qwen3_code_predictor.CodePredictorWrapper = _Qwen3TTSTalkerCodePredictor310P
 
     _PATCHED = True
