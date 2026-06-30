@@ -20,6 +20,7 @@ from vllm_omni.model_executor.models.qwen3_tts import (
     qwen3_tts_talker,
 )
 from vllm_ascend._310p.attention.attention_mask import AttentionMaskBuilder310
+from vllm_ascend.sample.sampler import apply_top_k_top_p, random_sample
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, aligned_16, maybe_trans_nz, nd_to_nz_2d
 import torch_npu
 
@@ -450,6 +451,8 @@ class _Qwen3TTSTalkerCodePredictor310P(
         lm_heads = self._lm_heads_list
         codec_embeds = self._codec_embeds_list
         projected_codec_embed_weight = self._projected_codec_embed_weight
+        vocab_size = int(lm_heads[0].out_features)
+        generators = {i: generator for i in range(bsz)} if generator is not None else {}
 
         proj_buf[:padded_bsz].zero_()
         initial_embeds = torch.cat(
@@ -472,6 +475,21 @@ class _Qwen3TTSTalkerCodePredictor310P(
                 raise NotImplementedError(
                     "top_p sampling is not implemented for the vLLM-native code predictor; please set top_p=1.0."
                 )
+
+        top_k_tensor = None
+        top_p_tensor = None
+        if stored_mode:
+            top_k_hint = s_top_k if s_top_k > 0 else None
+            if s_top_k > 0:
+                top_k_tensor = torch.full((bsz,), s_top_k, dtype=torch.int32, device=device)
+            if s_top_p < 1.0:
+                top_p_tensor = torch.full((bsz,), s_top_p, dtype=dtype, device=device)
+        elif use_sampling:
+            top_k_hint = top_k if top_k > 0 else None
+            if top_k > 0:
+                top_k_tensor = torch.full((bsz,), top_k, dtype=torch.int32, device=device)
+        else:
+            top_k_hint = None
 
         if self._wrapper_config.return_proj_buf:
             all_codes = torch.empty(bsz, num_groups, 1, dtype=torch.int64, device=device)
@@ -507,28 +525,22 @@ class _Qwen3TTSTalkerCodePredictor310P(
             logits = lm_heads[step - 1](hidden_out[:bsz, step, :])
 
             if stored_mode:
-                if s_top_k > 0:
-                    topk_vals, _ = logits.topk(s_top_k, dim=-1)
-                    logits = logits.masked_fill(logits < topk_vals[:, -1:], float("-inf"))
-                if s_top_p < 1.0:
-                    sorted_logits, sorted_idx = logits.sort(dim=-1, descending=True)
-                    sorted_probs = F.softmax(sorted_logits, dim=-1, dtype=torch.float32)
-                    cumulative_probs = sorted_probs.cumsum(dim=-1)
-                    remove_mask = (cumulative_probs - sorted_probs) >= s_top_p
-                    sorted_logits[remove_mask] = float("-inf")
-                    logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
+                if top_k_tensor is not None or top_p_tensor is not None:
+                    logits = apply_top_k_top_p(logits, p=top_p_tensor, k=top_k_tensor, top_k=top_k_hint)
                 probs = F.softmax(logits, dim=-1, dtype=torch.float32)
-                code = torch.multinomial(probs, num_samples=1, generator=generator)
+                code = random_sample(probs, generators)
             else:
                 if use_sampling:
                     scaled = logits * inv_temperature
-                    if top_k > 0:
-                        topk_vals, _ = scaled.topk(top_k, dim=-1)
-                        scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
+                    if top_k_tensor is not None:
+                        scaled = apply_top_k_top_p(scaled, p=None, k=top_k_tensor, top_k=top_k_hint)
                     probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
-                    code = torch.multinomial(probs, num_samples=1, generator=generator)
+                    code = random_sample(probs, generators)
                 else:
                     code = logits.argmax(dim=-1, keepdim=True)
+
+            if self._wrapper_config.return_proj_buf:
+                code = code.unsqueeze(-1)
 
             if self._wrapper_config.return_proj_buf:
                 all_codes[:, step] = code
