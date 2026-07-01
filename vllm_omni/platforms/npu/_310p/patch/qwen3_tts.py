@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -27,6 +29,8 @@ import torch_npu
 _RUNTIME_DTYPE = torch.float16
 _CPU_DEVICE = torch.device("cpu")
 _PATCHED = False
+_CODE2WAV_PATCHED = False
+_code2wav_original_load_weights = None
 
 logger = init_logger(__name__)
 
@@ -117,6 +121,77 @@ class _Qwen3TTSPromptEmbedsBuilder310P(prompt_embeds_builder.Qwen3TTSPromptEmbed
         ).transpose(1, 2)
         spk = self._speaker_encoder(mels.to(device=dev, dtype=dtype))[0]
         return spk.to(dtype=dtype)
+
+
+def _prepare_code2wav_weights_310p(model) -> None:
+    """Pack Code2Wav weights for the 310P runtime."""
+    if not hasattr(model, "decoder"):
+        return
+
+    decoder = model.decoder
+    device = next(decoder.parameters()).device
+    if device.type != "npu":
+        return
+
+    decoder.to(device=device, dtype=torch.float16)
+
+    linear_count = 0
+    with torch.no_grad():
+        for module in decoder.modules():
+            if hasattr(module, "weight") and module.__class__.__name__ == "Linear":
+                module.weight.data = maybe_trans_nz(module.weight.data)
+                linear_count += 1
+
+    if hasattr(decoder, "precompute_snake_caches"):
+        decoder.precompute_snake_caches()
+
+    logger.info("Prepared 310P code2wav weights: linear=%d dtype=float16", linear_count)
+
+
+def _apply_code2wav_load_weights_patch() -> None:
+    from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav import Qwen3TTSCode2Wav
+
+    global _CODE2WAV_PATCHED, _code2wav_original_load_weights
+    if _CODE2WAV_PATCHED:
+        return
+
+    _code2wav_original_load_weights = Qwen3TTSCode2Wav.load_weights
+
+    def _load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        decoder = getattr(self, "decoder", None)
+        original_enable_cudagraph = getattr(decoder, "enable_cudagraph", None)
+        pending_cudagraph: dict[str, object] = {}
+
+        if decoder is not None and callable(original_enable_cudagraph):
+
+            def _capture_enable_cudagraph(*args, **kwargs):
+                pending_cudagraph["args"] = args
+                pending_cudagraph["kwargs"] = kwargs
+
+            decoder.enable_cudagraph = _capture_enable_cudagraph  # type: ignore[method-assign]
+
+        try:
+            loaded = _code2wav_original_load_weights(self, weights)
+        finally:
+            if decoder is not None and callable(original_enable_cudagraph):
+                decoder.enable_cudagraph = original_enable_cudagraph  # type: ignore[method-assign]
+
+        if _code2wav_should_patch_runtime():
+            _prepare_code2wav_weights_310p(self)
+            if pending_cudagraph and callable(original_enable_cudagraph):
+                original_enable_cudagraph(*pending_cudagraph["args"], **pending_cudagraph["kwargs"])  # type: ignore[arg-type]
+
+        return loaded
+
+    Qwen3TTSCode2Wav.load_weights = _load_weights  # type: ignore[method-assign]
+    _CODE2WAV_PATCHED = True
+    logger.debug("Applied 310P patch for Qwen3TTSCode2Wav.load_weights")
+
+
+def _code2wav_should_patch_runtime() -> bool:
+    from vllm_omni.platforms.npu._310p import is_310p
+
+    return is_310p()
 
 
 # ===================================================================
@@ -598,3 +673,14 @@ def apply_talker_patches() -> None:
     qwen3_code_predictor.CodePredictorWrapper = _Qwen3TTSTalkerCodePredictor310P
 
     _PATCHED = True
+
+
+def apply_code2wav_patches() -> None:
+    """Install the 310P Code2Wav runtime patch."""
+    if _CODE2WAV_PATCHED:
+        return
+
+    if not _code2wav_should_patch_runtime():
+        return
+
+    _apply_code2wav_load_weights_patch()

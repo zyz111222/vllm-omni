@@ -16,15 +16,16 @@ def apply_patches() -> None:
         return
 
     from vllm_omni.platforms.npu._310p.patch.worker import apply_patch
+    from vllm_omni.platforms.npu._310p.patch.qwen3_tts import apply_code2wav_patches
 
     apply_patch()
+    apply_code2wav_patches()
     _WORKER_PATCHED = True
 
 
 def apply_model_patches(model_config) -> None:
-    if getattr(model_config, "model_arch", None) != _QWEN3_TTS_TALKER_ARCH:
-        return
+    model_arch = getattr(model_config, "model_arch", None)
+    if model_arch == _QWEN3_TTS_TALKER_ARCH:
+        from vllm_omni.platforms.npu._310p.patch.qwen3_tts import apply_talker_patches
 
-    from vllm_omni.platforms.npu._310p.patch.qwen3_tts import apply_talker_patches
-
-    apply_talker_patches()
+        apply_talker_patches()
