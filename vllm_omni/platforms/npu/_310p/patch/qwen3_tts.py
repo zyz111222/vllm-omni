@@ -30,7 +30,6 @@ _RUNTIME_DTYPE = torch.float16
 _CPU_DEVICE = torch.device("cpu")
 _PATCHED = False
 _CODE2WAV_PATCHED = False
-_code2wav_original_load_weights = None
 
 logger = init_logger(__name__)
 
@@ -151,11 +150,11 @@ def _prepare_code2wav_weights_310p(model) -> None:
 def _apply_code2wav_load_weights_patch() -> None:
     from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav import Qwen3TTSCode2Wav
 
-    global _CODE2WAV_PATCHED, _code2wav_original_load_weights
+    global _CODE2WAV_PATCHED
     if _CODE2WAV_PATCHED:
         return
 
-    _code2wav_original_load_weights = Qwen3TTSCode2Wav.load_weights
+    original_load_weights = Qwen3TTSCode2Wav.load_weights
 
     def _load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         decoder = getattr(self, "decoder", None)
@@ -171,7 +170,7 @@ def _apply_code2wav_load_weights_patch() -> None:
             decoder.enable_cudagraph = _capture_enable_cudagraph  # type: ignore[method-assign]
 
         try:
-            loaded = _code2wav_original_load_weights(self, weights)
+            loaded = original_load_weights(self, weights)
         finally:
             if decoder is not None and callable(original_enable_cudagraph):
                 decoder.enable_cudagraph = original_enable_cudagraph  # type: ignore[method-assign]

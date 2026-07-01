@@ -7,6 +7,7 @@ from __future__ import annotations
 
 _WORKER_PATCHED = False
 _QWEN3_TTS_TALKER_ARCH = "Qwen3TTSTalkerForConditionalGeneration"
+_QWEN3_TTS_CODE2WAV_ARCH = "Qwen3TTSCode2Wav"
 
 
 def apply_patches() -> None:
@@ -28,7 +29,7 @@ def apply_model_patches(model_config) -> None:
 
         apply_talker_patches()
         return
-    if model_arch == "Qwen3TTSCode2Wav":
+    elif model_arch == _QWEN3_TTS_CODE2WAV_ARCH:
         from vllm_omni.platforms.npu._310p.patch.qwen3_tts import apply_code2wav_patches
 
         apply_code2wav_patches()
