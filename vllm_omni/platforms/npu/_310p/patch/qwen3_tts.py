@@ -21,6 +21,7 @@ from vllm_omni.model_executor.models.qwen3_tts import (
     qwen3_tts_code_predictor_vllm,
     qwen3_tts_talker,
 )
+from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz import modeling_qwen3_tts_tokenizer_v2
 from vllm_ascend._310p.attention.attention_mask import AttentionMaskBuilder310
 from vllm_ascend.sample.sampler import apply_top_k_top_p, random_sample
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, aligned_16, maybe_trans_nz, nd_to_nz_2d
@@ -191,6 +192,51 @@ def _code2wav_should_patch_runtime() -> bool:
     from vllm_omni.platforms.npu._310p import is_310p
 
     return is_310p()
+
+
+# ===================================================================
+#  Code2Wav layer patches
+# ===================================================================
+#
+# Code2Wav runs under the 310P graph path after the stage-0 Talker has
+# produced codec tokens.  Keep the portable tokenizer implementation
+# unchanged, and install only the fused operators that preserve the decoder
+# math exactly on 310P.
+
+
+class _Qwen3TTSTokenizerV2DecoderRMSNorm310P(nn.Module):
+    """Code2Wav RMSNorm using the Ascend NPU fused kernel.
+
+    The source implementation expands RMSNorm into cast, square, mean, rsqrt,
+    mul and weight kernels.  These small kernels are visible in Code2Wav
+    profiling, so the 310P patch uses the same fused op as vLLM Ascend's
+    decoder RMSNorm.
+    """
+
+    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return torch_npu.npu_rms_norm(hidden_states, self.weight, epsilon=self.variance_epsilon)[0]
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+
+
+def _code2wav_apply_rotary_pos_emb_310p(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    """Apply Code2Wav RoPE with the Ascend fused rotary kernel on 310P."""
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    return torch_npu.npu_rotary_mul(q, cos, sin), torch_npu.npu_rotary_mul(k, cos, sin)
+
+
+def _apply_code2wav_layer_patches() -> None:
+    # Match vLLM Ascend's decoder path: replace portable PyTorch RMSNorm and
+    # RoPE decomposition with the 310P fused kernels before Code2Wav is built.
+    modeling_qwen3_tts_tokenizer_v2.Qwen3TTSTokenizerV2DecoderRMSNorm = _Qwen3TTSTokenizerV2DecoderRMSNorm310P
+    modeling_qwen3_tts_tokenizer_v2.apply_rotary_pos_emb = _code2wav_apply_rotary_pos_emb_310p
 
 
 # ===================================================================
@@ -682,4 +728,5 @@ def apply_code2wav_patches() -> None:
     if not _code2wav_should_patch_runtime():
         return
 
+    _apply_code2wav_layer_patches()
     _apply_code2wav_load_weights_patch()
