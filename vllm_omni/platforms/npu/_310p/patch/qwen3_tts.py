@@ -28,6 +28,7 @@ from vllm_ascend.sample.sampler import apply_top_k_top_p, random_sample
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, aligned_16, maybe_trans_nz, nd_to_nz_2d
 import torch_npu
 
+ACL_FORMAT_FRACTAL_Z = 4
 _RUNTIME_DTYPE = torch.float16
 _CPU_DEVICE = torch.device("cpu")
 _PATCHED = False
@@ -143,16 +144,23 @@ class _Qwen3TTSCode2Wav310P(qwen3_tts_code2wav.Qwen3TTSCode2Wav):
         decoder.to(device=device, dtype=torch.float16)
 
         linear_count = 0
+        conv_count = 0
         with torch.no_grad():
             for module in decoder.modules():
                 if hasattr(module, "weight") and module.__class__.__name__ == "Linear":
                     module.weight.data = maybe_trans_nz(module.weight.data)
                     linear_count += 1
+                elif isinstance(module, (nn.Conv1d, nn.ConvTranspose1d)) and module.groups == 1:
+                    # Stage-1 uses 1D convs that lower to Conv2D on 310P. Pack
+                    # groups==1 filters once so the captured decode graph does
+                    # not pay the same filter-layout conversion every replay.
+                    module.weight.data = torch_npu.npu_format_cast(module.weight.data.contiguous(), ACL_FORMAT_FRACTAL_Z)
+                    conv_count += 1
 
         if hasattr(decoder, "precompute_snake_caches"):
             decoder.precompute_snake_caches()
 
-        logger.info("Prepared 310P code2wav weights: linear=%d dtype=float16", linear_count)
+        logger.info("Prepared 310P code2wav weights: linear=%d conv=%d dtype=float16", linear_count, conv_count)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         decoder = self.decoder
