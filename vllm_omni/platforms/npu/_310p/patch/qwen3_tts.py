@@ -63,7 +63,7 @@ class _Qwen3TTSTalker310P(qwen3_tts_talker.Qwen3TTSTalkerForConditionalGeneratio
             resampler = AudioResampler(target_sr=target_sr)
             wavs = [resampler.resample(w.astype(np.float32), orig_sr=int(sr)) for w in wavs]
 
-        inputs = fe(raw_audio=wavs, sampling_rate=target_sr, return_tensors="pt").to(_CPU_DEVICE).to(torch.float32)
+        inputs = fe(raw_audio=wavs, sampling_rate=target_sr, return_tensors="pt").to(torch.float32)
 
         with torch.inference_mode():
             encoded = self.encoder.encode(
@@ -169,9 +169,6 @@ class _Qwen3CodePredictorAttention310P(qwen3_code_predictor.CodePredictorAttenti
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if hidden_states.device.type != "npu" or attention_mask is None:
-            return super().forward(hidden_states, position_embeddings)
-
         bsz, seq_len, _ = hidden_states.shape
         qkv = F.linear(hidden_states, self._fused_qkv_weight, self._fused_qkv_bias)
         q, k, v = qkv.split((self._q_size, self._kv_size, self._kv_size), dim=-1)
@@ -257,9 +254,6 @@ class _Qwen3CodePredictorBaseModel310P(qwen3_code_predictor.CodePredictorBaseMod
         inputs_embeds: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
-        if inputs_embeds.device.type != "npu":
-            return super().forward(inputs_embeds, position_ids)
-
         if self._attention_mask_310p is None or self._attention_mask_310p_device != inputs_embeds.device:
             # Store the additive causal mask in the format consumed by the
             # 310P flash-attention kernel.
@@ -433,15 +427,25 @@ class _Qwen3TTSTalkerCodePredictor310P(
             if stored_mode:
                 if top_k_tensor is not None or top_p_tensor is not None:
                     logits = apply_top_k_top_p(logits, p=top_p_tensor, k=top_k_tensor, top_k=top_k_hint)
+                candidate_indices = None
+                if isinstance(logits, tuple):
+                    logits, candidate_indices = logits
                 probs = F.softmax(logits, dim=-1, dtype=torch.float32)
                 code = random_sample(probs, npu_generators)
+                if candidate_indices is not None:
+                    code = candidate_indices.gather(1, code.unsqueeze(1)).squeeze(1)
             else:
                 if use_sampling:
                     scaled = logits * inv_temperature
                     if top_k_tensor is not None:
                         scaled = apply_top_k_top_p(scaled, p=None, k=top_k_tensor, top_k=top_k_hint)
+                    candidate_indices = None
+                    if isinstance(scaled, tuple):
+                        scaled, candidate_indices = scaled
                     probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
                     code = random_sample(probs, npu_generators)
+                    if candidate_indices is not None:
+                        code = candidate_indices.gather(1, code.unsqueeze(1)).squeeze(1)
                 else:
                     code = logits.argmax(dim=-1, keepdim=True)
 

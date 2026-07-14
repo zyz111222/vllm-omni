@@ -70,13 +70,7 @@ class _RMSNorm(CustomOp):
     def forward_cuda(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.forward_native(hidden_states)
 
-    def forward_hip(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.forward_native(hidden_states)
-
     def forward_xpu(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.forward_native(hidden_states)
-
-    def forward_musa(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.forward_native(hidden_states)
 
     def forward_native(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -121,13 +115,7 @@ class _RotaryEmbedding(CustomOp):
     def forward_cuda(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.forward_native(x, position_ids)
 
-    def forward_hip(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.forward_native(x, position_ids)
-
     def forward_xpu(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.forward_native(x, position_ids)
-
-    def forward_musa(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.forward_native(x, position_ids)
 
     def forward_native(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
